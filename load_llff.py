@@ -6,6 +6,7 @@ import os, imageio
 ##########  see https://github.com/Fyusion/LLFF for original
 
 def _minify(basedir, factors=[], resolutions=[]):
+    # **** load imgs ****
     needtoload = False
     for r in factors:
         imgdir = os.path.join(basedir, 'images_{}'.format(r))
@@ -18,6 +19,7 @@ def _minify(basedir, factors=[], resolutions=[]):
     if not needtoload:
         return
     
+    # **** process the img file in dir if necessary ****
     from shutil import copy
     from subprocess import check_output
     
@@ -61,9 +63,9 @@ def _minify(basedir, factors=[], resolutions=[]):
         
 def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
     
-    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
-    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])
-    bds = poses_arr[:, -2:].transpose([1,0])
+    poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))  # (20, 17)
+    poses = poses_arr[:, :-2].reshape([-1, 3, 5]).transpose([1,2,0])  # (3, 5, 20)
+    bds = poses_arr[:, -2:].transpose([1,0])  # (2, 20)  (near, far) for every img
     
     img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
             if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
@@ -99,22 +101,22 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True):
         return
     
     sh = imageio.imread(imgfiles[0]).shape
-    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
-    poses[2, 4, :] = poses[2, 4, :] * 1./factor
+    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])  # (h, w)
+    poses[2, 4, :] = poses[2, 4, :] * 1./factor  # focal / factor
     
     if not load_imgs:
         return poses, bds
     
     def imread(f):
         if f.endswith('png'):
-            return imageio.imread(f, ignoregamma=True)
+            return imageio.imread(f, apply_gamma=False)
         else:
             return imageio.imread(f)
         
     imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
     imgs = np.stack(imgs, -1)  
     
-    print('Loaded image data', imgs.shape, poses[:,-1,0])
+    print('Loaded image data', imgs.shape, poses[:,-1,0])  # ((378, 504, 3, 20) [378., 504., 407.56579161]) (h, w, focal)
     return poses, bds, imgs
 
     
@@ -126,6 +128,7 @@ def normalize(x):
     return x / np.linalg.norm(x)
 
 def viewmatrix(z, up, pos):
+    """(z, y, center-position)"""
     vec2 = normalize(z)
     vec1_avg = up
     vec0 = normalize(np.cross(vec1_avg, vec2))
@@ -138,13 +141,16 @@ def ptstocam(pts, c2w):
     return tt
 
 def poses_avg(poses):
+    """poses:(B, 3, 5)
+        5: x, y, z, center, [h, w, focal]
+        or: rotation matrix + translation vector + [h, w, focal]
+    """
+    hwf = poses[0, :3, -1:]  # [h, w, focal]   0 for 1st batch, first three row's last column (3, 1)
 
-    hwf = poses[0, :3, -1:]
-
-    center = poses[:, :3, 3].mean(0)
-    vec2 = normalize(poses[:, :3, 2].sum(0))
-    up = poses[:, :3, 1].sum(0)
-    c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)
+    center = poses[:, :3, 3].mean(0)  # the position of the camera center in world coord (3, 1)
+    vec2 = normalize(poses[:, :3, 2].sum(0)) # camera Z-axis in world coord avg (3, 1)
+    up = poses[:, :3, 1].sum(0)  # camera Y-axis in world coord avg (3, 1)
+    c2w = np.concatenate([viewmatrix(vec2, up, center), hwf], 1)  # for orthogonal coord, so don't avg the x but calculate the x (3, 5)
     
     return c2w
 
@@ -164,15 +170,15 @@ def render_path_spiral(c2w, up, rads, focal, zdelta, zrate, rots, N):
 
 
 def recenter_poses(poses):
-
-    poses_ = poses+0
+    """return the new camera position in new world coord (20, 3, 5)"""
+    poses_ = poses+0  # deep clone the data  (20, 3, 5)
     bottom = np.reshape([0,0,0,1.], [1,4])
-    c2w = poses_avg(poses)
-    c2w = np.concatenate([c2w[:3,:4], bottom], -2)
-    bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1])
-    poses = np.concatenate([poses[:,:3,:4], bottom], -2)
+    c2w = poses_avg(poses)  # average the pose (3, 5)
+    c2w = np.concatenate([c2w[:3,:4], bottom], -2)  # (4, 4) = (3, 4) + (1, 4)
+    bottom = np.tile(np.reshape(bottom, [1,1,4]), [poses.shape[0],1,1])  # (20, 1, 4) all of them are [0,0,0,1.]
+    poses = np.concatenate([poses[:,:3,:4], bottom], -2)  # (20, 4, 4) concatenate to get the homogenous matrix
 
-    poses = np.linalg.inv(c2w) @ poses
+    poses = np.linalg.inv(c2w) @ poses  # to get the new poses of camera in the world: w2c @ c = w
     poses_[:,:3,:4] = poses[:,:3,:4]
     poses = poses_
     return poses
@@ -244,10 +250,14 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     
 
     poses, bds, imgs = _load_data(basedir, factor=factor) # factor=8 downsamples original imgs by 8x
-    print('Loaded', basedir, bds.min(), bds.max())
+    # poses: (3, 5, 20); bds: (2, 20); imgs: (378, 504, 3, 20)
+    print('Loaded', basedir, bds.min(), bds.max())  # ((near, far), batch): (2, 20)
     
     # Correct rotation matrix ordering and move variable dim to axis 0
-    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)
+    # from LLFF to OpenGL coord: x'=y, y'=-x, z'=z. but shape hasn't change
+    poses = np.concatenate([poses[:, 1:2, :], -poses[:, 0:1, :], poses[:, 2:, :]], 1)  # (3, 5 ,20)
+
+    # move batch_size to the first dim
     poses = np.moveaxis(poses, -1, 0).astype(np.float32)
     imgs = np.moveaxis(imgs, -1, 0).astype(np.float32)
     images = imgs
@@ -255,17 +265,16 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
     
     # Rescale if bd_factor is provided
     sc = 1. if bd_factor is None else 1./(bds.min() * bd_factor)
-    poses[:,:3,3] *= sc
+    poses[:,:3,3] *= sc  #! w2c matrix's translation vector need to multiply the near-far scale
     bds *= sc
     
     if recenter:
-        poses = recenter_poses(poses)
-        
+        poses = recenter_poses(poses)  # re-centerlize world coord to avg-camera center coord, return the cameras -> new world (c2w)
+
+    # render trace (can change it by yourself)
     if spherify:
         poses, render_poses, bds = spherify_poses(poses, bds)
-
     else:
-        
         c2w = poses_avg(poses)
         print('recentered', c2w.shape)
         print(c2w[:3,:4])
@@ -289,7 +298,7 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
         N_views = 120
         N_rots = 2
         if path_zflat:
-#             zloc = np.percentile(tt, 10, 0)[2]
+            # zloc = np.percentile(tt, 10, 0)[2]
             zloc = -close_depth * .1
             c2w_path[:3,3] = c2w_path[:3,3] + zloc * c2w_path[:3,2]
             rads[2] = 0.
@@ -302,12 +311,13 @@ def load_llff_data(basedir, factor=8, recenter=True, bd_factor=.75, spherify=Fal
         
     render_poses = np.array(render_poses).astype(np.float32)
 
-    c2w = poses_avg(poses)
+    c2w = poses_avg(poses) # (3, 5) syn-camera's new world origin, in order to find the nearest camera to the realtive center for test set
     print('Data:')
     print(poses.shape, images.shape, bds.shape)
     
-    dists = np.sum(np.square(c2w[:3,3] - poses[:,:3,3]), -1)
-    i_test = np.argmin(dists)
+    # (3, 1) - (20, 3, 1)
+    dists = np.sum(np.square(c2w[:3,3] - poses[:,:3,3]), -1)  # sum(center of world - all camera center's position)
+    i_test = np.argmin(dists)  # find the point closest to the origin of wolrd coord as a test set
     print('HOLDOUT view is', i_test)
     
     images = images.astype(np.float32)
